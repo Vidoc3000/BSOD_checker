@@ -64,6 +64,25 @@ class DumpParsingTests(unittest.TestCase):
         self.assertEqual(partial.bugcheck_code, 0x1A)
         self.assertEqual(da.parse_output("IMAGE_NAME:\nMODULE_NAME: foo").image_name, "")
 
+    def test_access_denied_is_classified_and_raw_output_preserved(self):
+        output = ("Loading Dump File [C:\\WINDOWS\\MEMORY.DMP]\n"
+                  "Could not open dump file [C:\\WINDOWS\\MEMORY.DMP], Win32 error 0n5\n"
+                  '    "Отказано в доступе."\n'
+                  "Debuggee initialization failed, Win32 error 0n5")
+        result = da.parse_output(output)
+        self.assertEqual(result.status, "error")
+        self.assertEqual(result.error_code, "access_denied")
+        self.assertIn("администратора", result.message)
+        self.assertEqual(result.raw_output, output)
+        for code in ("5", "0n5", "0x00000005"):
+            self.assertEqual(da.parse_output("Debuggee initialization failed, Win32 error " + code).error_code, "access_denied")
+        for code in ("0n50", "0n53", "0x50", "2"):
+            self.assertNotEqual(da.parse_output("Debuggee initialization failed, Win32 error " + code).error_code, "access_denied")
+        self.assertNotEqual(da.parse_output("Symbol lookup failed, Win32 error 0n5").error_code, "access_denied")
+        with tempfile.TemporaryDirectory() as temp, patch.object(da, "data_dir", return_value=Path(temp)), patch.object(da.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, output, "")):
+            self.assertEqual(da.analyze_dump("memory.dmp", "cdb.exe").error_code, "access_denied")
+            self.assertIn("администратора", da.analyze_dump("memory.dmp", "cdb.exe").message)
+
     def test_symbol_warnings_and_partial(self):
         result = da.parse_output(SAMPLE + "\n*** ERROR: symbols could not be loaded\n")
         self.assertEqual(result.status, "partial")
