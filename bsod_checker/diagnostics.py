@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import os
 import platform
+import shutil
+import ctypes
 import re
 import subprocess
 from dataclasses import asdict, dataclass, field
@@ -31,6 +33,42 @@ class Dump:
 
 
 @dataclass
+class ResourceSnapshot:
+    disk_path: str = ""
+    disk_total: int | None = None
+    disk_free: int | None = None
+    memory_total: int | None = None
+    memory_available: int | None = None
+    warnings: list[str] = field(default_factory=list)
+
+
+def resource_snapshot(root: Path) -> ResourceSnapshot:
+    """Current resource state, not a reconstruction of the state at crash time."""
+    result = ResourceSnapshot(disk_path=str(root))
+    try:
+        usage = shutil.disk_usage(root)
+        result.disk_total, result.disk_free = usage.total, usage.free
+    except OSError as exc:
+        result.warnings.append(f"Не удалось проверить свободное место: {exc}")
+    try:
+        class MemoryStatus(ctypes.Structure):
+            _fields_ = [("length", ctypes.c_uint32), ("load", ctypes.c_uint32),
+                        ("total_phys", ctypes.c_uint64), ("avail_phys", ctypes.c_uint64),
+                        ("total_page", ctypes.c_uint64), ("avail_page", ctypes.c_uint64),
+                        ("total_virtual", ctypes.c_uint64), ("avail_virtual", ctypes.c_uint64),
+                        ("avail_extended", ctypes.c_uint64)]
+        state = MemoryStatus()
+        state.length = ctypes.sizeof(state)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        if not kernel32.GlobalMemoryStatusEx(ctypes.byref(state)):
+            raise OSError(ctypes.get_last_error(), "GlobalMemoryStatusEx")
+        result.memory_total, result.memory_available = state.total_phys, state.avail_phys
+    except (AttributeError, OSError) as exc:
+        result.warnings.append(f"Не удалось проверить оперативную память: {exc}")
+    return result
+
+
+@dataclass
 class Report:
     generated: str
     system: str
@@ -38,6 +76,7 @@ class Report:
     events: list[Event] = field(default_factory=list)
     dumps: list[Dump] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    resources: ResourceSnapshot | None = None
 
     def to_dict(self):
         return asdict(self)
@@ -55,7 +94,7 @@ def _run_powershell(script: str) -> str:
     return result.stdout.strip()
 
 
-def collect(days: int = 30, max_events: int = 100, *, cdb_path: str = "", online_symbols: bool = False, max_dumps: int = 10, progress: Callable[[str], None] | None = None) -> Report:
+def collect(days: int = 30, max_events: int = 100, *, cdb_path: str = "", online_symbols: bool = False, max_dumps: int = 10, progress: Callable[[str], None] | None = None, cdb_resolver: Callable[[], tuple[str | None, str | None]] | None = None) -> Report:
     if not 1 <= days <= 365 or not 1 <= max_events <= 500:
         raise ValueError("Период должен быть от 1 до 365 дней, число событий — от 1 до 500.")
     if not 1 <= max_dumps <= 100:
@@ -68,10 +107,14 @@ def collect(days: int = 30, max_events: int = 100, *, cdb_path: str = "", online
     script = f'''$OutputEncoding = [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding
 $ErrorActionPreference = 'Stop'
 try {{
-$events = @(Get-WinEvent -FilterHashtable @{{LogName='System'; Id=1001,41,6008; StartTime=(Get-Date).AddDays(-{days})}} -MaxEvents {max_events} -ErrorAction Stop | Where-Object {{
+$events = @(Get-WinEvent -FilterHashtable @{{LogName='System'; Id=1001,41,6008,1,17,18,19,47,7,51,129,153,161,162; StartTime=(Get-Date).AddDays(-{days})}} -MaxEvents {max_events} -ErrorAction Stop | Where-Object {{
   ($_.Id -eq 1001 -and $_.ProviderName -eq 'Microsoft-Windows-WER-SystemErrorReporting') -or
   ($_.Id -eq 41 -and $_.ProviderName -eq 'Microsoft-Windows-Kernel-Power') -or
-  ($_.Id -eq 6008 -and $_.ProviderName -eq 'EventLog')
+  ($_.Id -eq 6008 -and $_.ProviderName -eq 'EventLog') -or
+  ($_.Id -in @(1,17,18,19,47) -and $_.ProviderName -eq 'Microsoft-Windows-WHEA-Logger') -or
+  ($_.Id -in @(7,51,153) -and $_.ProviderName -eq 'disk') -or
+  ($_.Id -eq 129 -and $_.ProviderName -in @('storahci','stornvme','iaStorA','iaStorAVC')) -or
+  ($_.Id -in @(161,162) -and $_.ProviderName -eq 'volmgr')
 }} | ForEach-Object {{ [PSCustomObject]@{{ time=$_.TimeCreated.ToString('o'); event_id=$_.Id; provider=$_.ProviderName; message=$_.Message }} }})
 }} catch {{ if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') {{ $events = @() }} else {{ throw }} }}
 ConvertTo-Json -InputObject $events -Depth 3 -Compress'''
@@ -86,6 +129,7 @@ ConvertTo-Json -InputObject $events -Depth 3 -Compress'''
     except (OSError, subprocess.TimeoutExpired, RuntimeError, ValueError, TypeError, KeyError) as exc:
         report.warnings.append(f"Не удалось прочитать журнал событий: {exc}. Попробуйте запустить программу от имени администратора.")
     root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    report.resources = resource_snapshot(root)
     try:
         paths = [root / "MEMORY.DMP"]
         dump_dir = root / "Minidump"
@@ -105,8 +149,13 @@ ConvertTo-Json -InputObject $events -Depth 3 -Compress'''
         report.warnings.append(f"Не удалось проверить папку дампов: {exc}")
     if report.dumps:
         cdb = dump_analysis.find_cdb(cdb_path)
+        install_error = None
+        if cdb is None and cdb_resolver is not None:
+            cdb, install_error = cdb_resolver()
         if cdb is None:
             message = ("Отладчик cdb.exe не найден. Установите Debugging Tools for Windows или укажите путь на вкладке «Настройки».")
+            if install_error:
+                message += " " + install_error
             report.warnings.append(message)
             for dump in report.dumps:
                 dump.analysis.message = message
@@ -167,6 +216,17 @@ def recommendations(report: Report) -> list[tuple[str, str]]:
             result.append((f"Дамп: {Path(dump.path).name}", f"Отладчик указал: {suspect}. Это зацепка, а не доказанная причина; проверьте стек, символы и версию драйвера перед изменениями."))
     if any(e.event_id in (41, 6008) for e in report.events):
         result.append(("Неожиданное выключение", "Kernel-Power 41 и EventLog 6008 подтверждают некорректное завершение работы, но сами по себе не доказывают BSOD и не указывают его причину. Проверьте питание и события рядом по времени."))
+    if any(e.provider.lower() == "microsoft-windows-whea-logger" for e in report.events):
+        result.append(("Аппаратные события WHEA", "Обнаружены аппаратные сообщения Windows. Проверьте подробности событий, охлаждение, настройки разгона и обновления BIOS; WHEA не всегда означает причину BSOD."))
+    if any(e.provider.lower() in ("disk", "storahci", "stornvme", "iastora", "iastoravc") for e in report.events):
+        result.append(("События накопителя", "Проверьте резервные копии, соединения и состояние накопителя средствами его производителя. Ошибки ввода-вывода не доказывают неисправность самого диска."))
+    if any(e.provider.lower() == "volmgr" for e in report.events):
+        result.append(("Создание дампа", "Обнаружено событие диспетчера томов. Прочитайте его текст: некоторые события указывают на ошибку записи дампа; проверьте параметры дампа, файл подкачки и свободное место."))
+    resource = report.resources
+    if resource and resource.disk_total and resource.disk_free is not None and resource.disk_free / resource.disk_total < 0.1:
+        result.append(("Мало свободного места", "Сейчас на системном томе свободно менее 10%. Освободите место и проверьте параметры файла подкачки. Это текущий снимок, а не состояние во время сбоя."))
+    if resource and resource.memory_total and resource.memory_available is not None and resource.memory_available / resource.memory_total < 0.1:
+        result.append(("Мало доступной памяти", "Сейчас доступно менее 10% оперативной памяти. Проверьте приложения в диспетчере задач. Это текущий снимок, а не состояние во время сбоя."))
     if report.dumps:
         result.append(("Дампы памяти", "Откройте каждый дамп в списке анализа. Отладчик может ошибаться, особенно при неполных символах; для перепроверки используйте WinDbg."))
     result.extend([

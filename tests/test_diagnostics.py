@@ -67,6 +67,27 @@ class DiagnosticsTests(unittest.TestCase):
             finally:
                 for p in reversed(common): p.stop()
 
+    def test_resolver_runs_only_when_debugger_missing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            (Path(temp) / "MEMORY.DMP").write_bytes(b"dump")
+            with patch.object(d.os, "name", "nt"), patch.object(d, "Path", PosixPath), patch.dict(os.environ, {"SystemRoot": temp}), patch.object(d, "_run_powershell", return_value="[]"), patch.object(d.dump_analysis, "find_cdb", return_value=None), patch.object(d.dump_analysis, "analyze_dump", return_value=d.dump_analysis.DumpAnalysis(status="ok")) as analyze:
+                report = d.collect(cdb_resolver=lambda: ("installed-cdb.exe", None))
+                self.assertEqual(analyze.call_args.args[1], "installed-cdb.exe")
+                self.assertEqual(report.dumps[0].analysis.status, "ok")
+                report = d.collect(cdb_resolver=lambda: (None, "Установка отменена"))
+                self.assertIn("Установка отменена", report.warnings[0])
+
+    def test_whea_storage_and_current_resource_recommendations(self):
+        report = d.Report("", "", 30, events=[
+            d.Event("", 18, "Microsoft-Windows-WHEA-Logger", ""),
+            d.Event("", 153, "disk", ""),
+            d.Event("", 161, "volmgr", ""),
+        ], resources=d.ResourceSnapshot(disk_total=1000, disk_free=50, memory_total=1000, memory_available=50))
+        text = "\n".join(title + " " + body for title, body in d.recommendations(report))
+        for expected in ("WHEA", "накопителя", "Создание дампа", "Мало свободного места", "Мало доступной памяти", "текущий снимок"):
+            self.assertIn(expected, text)
+        self.assertEqual(report.to_dict()["resources"]["disk_free"], 50)
+
     def test_invalid_limits(self):
         for args in [(0, 100), (366, 100), (30, 0), (30, 501)]:
             with self.assertRaises(ValueError): d.collect(*args)

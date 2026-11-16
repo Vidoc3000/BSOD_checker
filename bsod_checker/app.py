@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import json
+import os
+import platform
+from datetime import datetime
 import queue
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import __version__, diagnostics, tweaks
+from . import __version__, debugger_install, diagnostics, dump_analysis, tweaks
 
 BG = "#0b1020"
 PANEL = "#151e32"
@@ -110,6 +113,7 @@ class App(tk.Tk):
         actions = ttk.Frame(top); actions.pack(side="right", anchor="n", pady=5)
         self.scan_button = ttk.Button(actions, text="▶   Запустить анализ", style="Accent.TButton", command=self.start_scan); self.scan_button.pack(side="right")
         ttk.Button(actions, text="Экспорт JSON", command=self.export).pack(side="right", padx=8)
+        self.import_button = ttk.Button(actions, text="Открыть дамп…", command=self.import_dump); self.import_button.pack(side="right")
         self._heading(top, "Обзор системы", "События Windows и автоматический разбор дампов памяти")
         stats = ttk.Frame(self.analysis); stats.pack(fill="x", pady=(0, 14))
         for i, (title, note, color) in enumerate([("СОБЫТИЯ", "за выбранный период", ACCENT), ("ДАМПЫ", "найдено на компьютере", PURPLE), ("РАЗОБРАНО", "отладчиком Microsoft", "#f2c978")]):
@@ -164,9 +168,9 @@ class App(tk.Tk):
         pathrow = ttk.Frame(self.settings); pathrow.pack(fill="x")
         ttk.Button(pathrow, text="Обзор…", command=self._browse_cdb).pack(side="right", padx=(8, 0))
         ttk.Entry(pathrow, textvariable=self.cdb_path).pack(side="left", fill="x", expand=True)
-        ttk.Label(self.settings, text="Оставьте пустым для автоматического поиска в PATH и Windows Kits. Установите Debugging Tools for Windows.", style="Muted.TLabel", wraplength=950).pack(anchor="w", pady=(5, 12))
+        ttk.Label(self.settings, text="Оставьте пустым для автоматического поиска. Если CDB не найден, программа предложит скачать и установить Debugging Tools for Windows.", style="Muted.TLabel", wraplength=950).pack(anchor="w", pady=(5, 12))
         ttk.Checkbutton(self.settings, text="Разрешить загрузку символов с сервера Microsoft", variable=self.online_symbols).pack(anchor="w", pady=(4, 5))
-        ttk.Label(self.settings, text="По умолчанию сеть не используется: только локальный кэш символов. При включении отладчик обращается к серверу Microsoft; названия и идентификаторы необходимых файлов могут передаваться серверу.", style="Muted.TLabel", wraplength=950, justify="left").pack(anchor="w")
+        ttk.Label(self.settings, text="Символы: по умолчанию только локальный кэш; при включении отладчик обращается к Microsoft. Установщик CDB скачивается отдельно после подтверждения.", style="Muted.TLabel", wraplength=950, justify="left").pack(anchor="w")
         ttk.Button(self.settings, text="Сохранить настройки", style="Accent.TButton", command=self.save_settings).pack(anchor="w", pady=22)
 
     def _browse_cdb(self):
@@ -177,7 +181,7 @@ class App(tk.Tk):
         self._heading(self.about, "О программе", "Инструмент для первичной диагностики сбоев Windows")
         text = (f"BSOD Checker  ·  версия {__version__}\n\n"
                 "Программа собирает события системного журнала и автоматически анализирует найденные дампы с помощью cdb.exe из Microsoft Debugging Tools for Windows. "
-                "Отладчик устанавливается отдельно. Если он недоступен, программа сообщит об этом и сохранит сведения о файлах и событиях.\n\n"
+                "Если отладчик отсутствует, программа предложит скачать официальный установщик Microsoft и установить Debugging Tools for Windows.\n\n"
                 "Результаты отладчика и рекомендации — зацепки, а не доказательство неисправности конкретного драйвера. "
                 "Неполные символы или повреждённый дамп могут привести к неполному результату. Kernel-Power 41 и EventLog 6008 не обязательно означают BSOD.\n\n"
                 "По умолчанию используются локальные символы; загрузка с сервера Microsoft включается отдельно в настройках. "
@@ -218,11 +222,69 @@ class App(tk.Tk):
         values = self._numbers()
         if not values: return
         cdb_path, online = self.cdb_path.get().strip(), self.online_symbols.get()
-        self.scan_button.configure(state="disabled"); self.status.set("Чтение событий и поиск дампов…")
+        self._set_busy(True); self.status.set("Чтение событий и поиск дампов…")
         def work():
             try:
-                report = diagnostics.collect(values[0], values[1], cdb_path=cdb_path, online_symbols=online, max_dumps=values[2], progress=lambda msg: self.results.put(("progress", msg)))
+                report = diagnostics.collect(values[0], values[1], cdb_path=cdb_path, online_symbols=online, max_dumps=values[2], progress=lambda msg: self.results.put(("progress", msg)), cdb_resolver=self._resolve_cdb)
                 self.results.put(("done", (report, None)))
+            except Exception as exc:
+                self.results.put(("done", (None, str(exc))))
+        threading.Thread(target=work, daemon=True).start()
+        self.after(100, self._poll)
+
+    def _set_busy(self, busy):
+        state = "disabled" if busy else "normal"
+        self.scan_button.configure(state=state)
+        self.import_button.configure(state=state)
+
+    def _resolve_cdb(self):
+        # The worker must never call Tk directly. The UI answers via the event.
+        response = {"event": threading.Event(), "allowed": False}
+        self.results.put(("install_request", response))
+        response["event"].wait()
+        if not response["allowed"]:
+            return None, "Установка отменена пользователем."
+        try:
+            path = debugger_install.install(progress=lambda msg: self.results.put(("progress", msg)))
+            self.results.put(("debugger_installed", path))
+            return path, None
+        except Exception as exc:
+            return None, f"Не удалось установить отладчик: {exc}"
+
+    def import_dump(self):
+        if os.name != "nt":
+            messagebox.showerror("Открыть дамп", "Анализ дампов доступен только в Windows.", parent=self); return
+        values = self._numbers()
+        if not values: return
+        path = filedialog.askopenfilename(parent=self, title="Выберите дамп памяти", filetypes=[("Дампы памяти", "*.dmp"), ("Все файлы", "*.*")])
+        if not path: return
+        try:
+            stat = Path(path).stat()
+            if not Path(path).is_file(): raise OSError("Выбранный путь не является файлом.")
+        except OSError as exc:
+            messagebox.showerror("Не удалось открыть дамп", str(exc), parent=self); return
+        dump = diagnostics.Dump(path, datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"), stat.st_size)
+        report = self.report or diagnostics.Report(datetime.now().isoformat(timespec="seconds"), platform.platform(), values[0])
+        cdb_path, online = self.cdb_path.get().strip(), self.online_symbols.get()
+        self._set_busy(True); self.status.set("Подготовка к анализу выбранного дампа…")
+        def work():
+            try:
+                cdb = dump_analysis.find_cdb(cdb_path)
+                error = None
+                if not cdb: cdb, error = self._resolve_cdb()
+                if cdb:
+                    self.results.put(("progress", "Анализ выбранного дампа…"))
+                    dump.analysis = dump_analysis.analyze_dump(path, cdb, online)
+                else:
+                    dump.analysis.message = error or "Отладчик cdb.exe не найден."
+                # Build a new list; the report currently displayed by Tk is not mutated in the worker.
+                from dataclasses import replace
+                dumps = [item for item in report.dumps if os.path.normcase(item.path) != os.path.normcase(path)] + [dump]
+                dumps.sort(key=lambda item: item.modified, reverse=True)
+                warnings = list(report.warnings)
+                if not cdb:
+                    warnings.append(f"Не удалось разобрать выбранный дамп: {dump.analysis.message}")
+                self.results.put(("done", (replace(report, dumps=dumps, warnings=warnings), None)))
             except Exception as exc:
                 self.results.put(("done", (None, str(exc))))
         threading.Thread(target=work, daemon=True).start()
@@ -234,8 +296,17 @@ class App(tk.Tk):
                 kind, value = self.results.get_nowait()
                 if kind == "progress":
                     self.status.set(value); continue
+                if kind == "install_request":
+                    value["allowed"] = messagebox.askyesno("Отладчик не найден", "Для разбора дампа необходим CDB. Скачать официальный установщик Windows SDK и установить компонент Debugging Tools for Windows?\n\nПонадобятся интернет, права администратора и подтверждение UAC. Скачанный установщик будет проверен по цифровой подписи Microsoft.", parent=self)
+                    value["event"].set()
+                    continue
+                if kind == "debugger_installed":
+                    self.cdb_path.set(value)
+                    self.save_settings()
+                    self.status.set("Отладчик установлен; продолжается анализ…")
+                    continue
                 report, error = value
-                self.scan_button.configure(state="normal")
+                self._set_busy(False)
                 if error:
                     self.status.set("Ошибка анализа"); messagebox.showerror("Ошибка анализа", error, parent=self); return
                 self._show_report(report); return
@@ -245,6 +316,16 @@ class App(tk.Tk):
     def _show_report(self, report):
         self.report = report
         self.tree.delete(*self.tree.get_children()); self.items.clear()
+        if report.resources:
+            r = report.resources
+            gib = lambda value: f"{value / 1024**3:.1f} ГиБ" if value is not None else "нет данных"
+            text = (f"ТЕКУЩИЙ СНИМОК СИСТЕМЫ\n\nСистемный том: {r.disk_path}\n"
+                    f"Свободно на томе: {gib(r.disk_free)} из {gib(r.disk_total)}\n"
+                    f"Доступно ОЗУ: {gib(r.memory_available)} из {gib(r.memory_total)}\n\n"
+                    "Эти значения получены во время анализа, а не в момент сбоя.")
+            if r.warnings: text += "\n\n" + "\n".join(r.warnings)
+            item = self.tree.insert("", "end", values=(report.generated.replace("T", " "), "Система", "Память и место"))
+            self.items[item] = text
         for dump in report.dumps:
             analysis = dump.analysis
             label = f"0x{analysis.bugcheck_code:08X}" if analysis.bugcheck_code is not None else {"skipped": "Не разобран", "error": "Ошибка", "partial": "Неполный разбор", "ok": "Разобран"}.get(analysis.status, analysis.status)
@@ -252,7 +333,7 @@ class App(tk.Tk):
             self.items[item] = self._dump_details(dump)
         for event in report.events:
             code = diagnostics.bugcheck_code(event)
-            label = f"0x{code:08X}" if code is not None else ("Выключение" if event.event_id in (41, 6008) else "Код не извлечён")
+            label = f"0x{code:08X}" if code is not None else ("Выключение" if event.event_id in (41, 6008) else event.provider)
             item = self.tree.insert("", "end", values=(event.time[:19].replace("T", " "), f"ID {event.event_id}", label))
             self.items[item] = f"СОБЫТИЕ WINDOWS\n\nИсточник: {event.provider}\nID: {event.event_id}\nВремя: {event.time}\n\nСООБЩЕНИЕ\n{event.message or 'Текст события недоступен.'}"
         self.metrics[0].set(str(len(report.events))); self.metrics[1].set(str(len(report.dumps)))
@@ -272,10 +353,11 @@ class App(tk.Tk):
         parts = [f"ДАМП ПАМЯТИ\n\nФайл: {dump.path}\nИзменён: {dump.modified}\nРазмер: {dump.size:,} байт\n\nСТАТУС\n{a.message}",
                  f"КОД ОСТАНОВКИ\n{code}" + (f" · {a.bugcheck_name}" if a.bugcheck_name else "")]
         if a.arguments: parts.append("ПАРАМЕТРЫ\n" + "\n".join(a.arguments))
-        fields = [("Возможная причина", a.probable_cause), ("Образ", a.image_name), ("Модуль", a.module_name), ("Процесс", a.process_name), ("Идентификатор сбоя", a.failure_bucket)]
+        fields = [("Возможная причина", a.probable_cause), ("Образ", a.image_name), ("Модуль", a.module_name), ("Процесс", a.process_name), ("Идентификатор сбоя", a.failure_bucket), ("Хэш сбоя", a.failure_hash), ("Символ", a.symbol_name), ("Версия ОС", a.os_version), ("Команда стека", a.stack_command)]
         if any(value for _, value in fields):
             parts.append("СВЕДЕНИЯ ОТЛАДЧИКА\n" + "\n".join(f"{name}: {value}" for name, value in fields if value) + "\n\nУказанный модуль — зацепка, не доказанная причина.")
         if a.warnings: parts.append("ПРЕДУПРЕЖДЕНИЯ\n" + "\n".join(a.warnings))
+        if a.analysis_values: parts.append("ПОКАЗАТЕЛИ АНАЛИЗА\n" + "\n".join(f"{key}: {value}" for key, value in a.analysis_values.items()))
         if a.stack: parts.append("СТЕК ВЫЗОВОВ\n" + a.stack)
         if a.raw_output: parts.append("ПОЛНЫЙ ВЫВОД ОТЛАДЧИКА\n" + a.raw_output)
         return "\n\n".join(parts)

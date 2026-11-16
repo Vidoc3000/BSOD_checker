@@ -24,6 +24,10 @@ PROCESS_NAME:  example.exe
 MODULE_NAME: sample
 IMAGE_NAME:  sample.sys
 FAILURE_BUCKET_ID:  AV_sample!function
+FAILURE_ID_HASH: {1234}
+OS_VERSION: 10.0.1
+    Key  : Analysis.CPU.mSec
+    Value: 123
 Probably caused by : sample.sys ( sample!function+10 )
 STACK_TEXT:
 fffff800`00000001 fffff800`00000002 : 00000000`00000050 : nt!KeBugCheckEx
@@ -44,6 +48,9 @@ class DumpParsingTests(unittest.TestCase):
         self.assertEqual(result.module_name, "sample")
         self.assertEqual(result.process_name, "example.exe")
         self.assertEqual(result.failure_bucket, "AV_sample!function")
+        self.assertEqual(result.failure_hash, "{1234}")
+        self.assertEqual(result.os_version, "10.0.1")
+        self.assertEqual(result.analysis_values["Analysis.CPU.mSec"], "123")
         self.assertIn("sample!function", result.stack)
         self.assertNotIn("SYMBOL_NAME", result.stack)
         self.assertEqual(result.raw_output, SAMPLE)
