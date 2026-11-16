@@ -25,6 +25,11 @@ class DumpAnalysis:
     module_name: str = ""
     process_name: str = ""
     failure_bucket: str = ""
+    failure_hash: str = ""
+    symbol_name: str = ""
+    os_version: str = ""
+    stack_command: str = ""
+    analysis_values: dict[str, str] = field(default_factory=dict)
     stack: str = ""
     warnings: list[str] = field(default_factory=list)
     raw_output: str = ""
@@ -74,6 +79,12 @@ def parse_output(output: str) -> DumpAnalysis:
     result.module_name = _field(output, "MODULE_NAME")
     result.process_name = _field(output, "PROCESS_NAME")
     result.failure_bucket = _field(output, "FAILURE_BUCKET_ID")
+    result.failure_hash = _field(output, "FAILURE_ID_HASH")
+    result.symbol_name = _field(output, "SYMBOL_NAME")
+    result.os_version = _field(output, "OS_VERSION")
+    result.stack_command = _field(output, "STACK_COMMAND")
+    # Newer !analyze output includes pairs such as Analysis.Elapsed.mSec.
+    result.analysis_values = dict(re.findall(r"(?im)^[ \t]*Key[ \t]*:[ \t]*([^\r\n]+)\r?\n[ \t]*Value[ \t]*:[ \t]*([^\r\n]+)", output))
     stack = re.search(r"(?ims)^\s*STACK_TEXT\s*:\s*\n(.*?)(?=\n\s*\n|\n[A-Z][A-Z0-9_]+\s*:|\Z)", output)
     if stack:
         result.stack = stack.group(1).strip()
