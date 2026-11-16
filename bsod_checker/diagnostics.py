@@ -9,6 +9,9 @@ import subprocess
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
+
+from . import dump_analysis
 
 
 @dataclass
@@ -24,6 +27,7 @@ class Dump:
     path: str
     modified: str
     size: int
+    analysis: dump_analysis.DumpAnalysis = field(default_factory=dump_analysis.DumpAnalysis)
 
 
 @dataclass
@@ -51,9 +55,11 @@ def _run_powershell(script: str) -> str:
     return result.stdout.strip()
 
 
-def collect(days: int = 30, max_events: int = 100) -> Report:
+def collect(days: int = 30, max_events: int = 100, *, cdb_path: str = "", online_symbols: bool = False, max_dumps: int = 10, progress: Callable[[str], None] | None = None) -> Report:
     if not 1 <= days <= 365 or not 1 <= max_events <= 500:
         raise ValueError("Период должен быть от 1 до 365 дней, число событий — от 1 до 500.")
+    if not 1 <= max_dumps <= 100:
+        raise ValueError("Число анализируемых дампов должно быть от 1 до 100.")
     report = Report(datetime.now().isoformat(timespec="seconds"), platform.platform(), days)
     if os.name != "nt":
         report.warnings.append("Диагностика доступна только в Windows. Запустите программу на проверяемом компьютере.")
@@ -97,6 +103,23 @@ ConvertTo-Json -InputObject $events -Depth 3 -Compress'''
         report.dumps.sort(key=lambda d: d.modified, reverse=True)
     except OSError as exc:
         report.warnings.append(f"Не удалось проверить папку дампов: {exc}")
+    if report.dumps:
+        cdb = dump_analysis.find_cdb(cdb_path)
+        if cdb is None:
+            message = ("Отладчик cdb.exe не найден. Установите Debugging Tools for Windows или укажите путь на вкладке «Настройки».")
+            report.warnings.append(message)
+            for dump in report.dumps:
+                dump.analysis.message = message
+        else:
+            for index, dump in enumerate(report.dumps):
+                if index >= max_dumps:
+                    dump.analysis.message = f"Пропущен: достигнут предел {max_dumps} дампов за анализ. Измените его в настройках."
+                    continue
+                if progress:
+                    progress(f"Анализ дампа {index + 1} из {min(len(report.dumps), max_dumps)}: {Path(dump.path).name}")
+                dump.analysis = dump_analysis.analyze_dump(dump.path, cdb, online_symbols)
+            if len(report.dumps) > max_dumps:
+                report.warnings.append(f"Проанализированы только первые {max_dumps} дампов. Остальные пропущены согласно настройкам.")
     return report
 
 
@@ -129,17 +152,23 @@ def bugcheck_code(event: Event) -> int | None:
 def recommendations(report: Report) -> list[tuple[str, str]]:
     result = []
     seen = set()
-    for event in report.events:
-        code = bugcheck_code(event)
+    codes = [dump.analysis.bugcheck_code for dump in report.dumps if dump.analysis.status in ("ok", "partial")]
+    codes.extend(bugcheck_code(event) for event in report.events)
+    for code in codes:
         if code is None or code in seen:
             continue
         seen.add(code)
-        name, advice = CODES.get(code, ("Неизвестный код", "Найдите код остановки в документации Microsoft и проанализируйте дамп в WinDbg."))
+        name, advice = CODES.get(code, ("Неизвестный код", "Найдите код остановки в документации Microsoft и изучите вывод отладчика."))
         result.append((f"0x{code:08X} · {name}", advice + " Это возможные направления проверки, а не установленная причина."))
+    for dump in report.dumps:
+        analysis = dump.analysis
+        suspect = analysis.probable_cause or analysis.image_name or analysis.module_name
+        if suspect and analysis.status in ("ok", "partial"):
+            result.append((f"Дамп: {Path(dump.path).name}", f"Отладчик указал: {suspect}. Это зацепка, а не доказанная причина; проверьте стек, символы и версию драйвера перед изменениями."))
     if any(e.event_id in (41, 6008) for e in report.events):
         result.append(("Неожиданное выключение", "Kernel-Power 41 и EventLog 6008 подтверждают некорректное завершение работы, но сами по себе не доказывают BSOD и не указывают его причину. Проверьте питание и события рядом по времени."))
     if report.dumps:
-        result.append(("Дампы памяти", "Для определения конкретного драйвера откройте подходящий по времени дамп в WinDbg и выполните !analyze -v. Эта программа проверяет только наличие и свойства файлов, не анализирует их содержимое."))
+        result.append(("Дампы памяти", "Откройте каждый дамп в списке анализа. Отладчик может ошибаться, особенно при неполных символах; для перепроверки используйте WinDbg."))
     result.extend([
         ("Системные файлы", "При подозрении на повреждение запустите от администратора sfc /scannow; при необходимости затем DISM /Online /Cleanup-Image /RestoreHealth."),
         ("Производительность и стабильность", "Проверьте свободное место на системном диске, температуры и автозагрузку в диспетчере задач. Обновляйте драйверы с сайта производителя; перед изменениями создайте точку восстановления."),
