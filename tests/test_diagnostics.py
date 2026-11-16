@@ -1,0 +1,50 @@
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path, PosixPath
+from unittest.mock import patch
+
+from bsod_checker import diagnostics as d
+
+
+class DiagnosticsTests(unittest.TestCase):
+    def test_bugcheck_only_for_system_error_provider(self):
+        e = d.Event("today", 1001, "Microsoft-Windows-WER-SystemErrorReporting", "Bugcheck was: 0x00000116 (0xffff0000)")
+        self.assertEqual(d.bugcheck_code(e), 0x116)
+        e.provider = "other"
+        self.assertIsNone(d.bugcheck_code(e))
+        e.event_id = 41
+        self.assertIsNone(d.bugcheck_code(e))
+
+    def test_recommendations_deduplicate_and_qualify_power_events(self):
+        e = d.Event("", 1001, "Microsoft-Windows-WER-SystemErrorReporting", "0x0000007e")
+        report = d.Report("", "", 30, [e, e, d.Event("", 41, "Microsoft-Windows-Kernel-Power", "")])
+        result = d.recommendations(report)
+        self.assertEqual(sum("0x0000007E" in title for title, _ in result), 1)
+        self.assertTrue(any("не доказывают BSOD" in body for _, body in result))
+
+    def test_collect_windows_and_missing_dump(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp) / "Minidump"
+            folder.mkdir()
+            (folder / "test.dmp").write_bytes(b"dump")
+            events = [{"time": "2025-01-01", "event_id": 1001, "provider": "Microsoft-Windows-WER-SystemErrorReporting", "message": "0x0000007e"}]
+            with patch.object(d.os, "name", "nt"), patch.object(d, "Path", PosixPath), patch.dict(os.environ, {"SystemRoot": temp}), patch.object(d, "_run_powershell", return_value=json.dumps(events)):
+                report = d.collect(30, 100)
+            self.assertEqual(len(report.events), 1)
+            self.assertEqual(report.dumps[0].size, 4)
+            self.assertFalse(report.warnings)
+
+    def test_collection_errors_are_visible(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.object(d.os, "name", "nt"), patch.object(d, "Path", PosixPath), patch.dict(os.environ, {"SystemRoot": temp}), patch.object(d, "_run_powershell", side_effect=OSError("access denied")):
+                report = d.collect()
+            self.assertIn("access denied", report.warnings[0])
+
+    def test_invalid_limits(self):
+        for args in [(0, 100), (366, 100), (30, 0), (30, 501)]:
+            with self.assertRaises(ValueError): d.collect(*args)
+
+
+if __name__ == "__main__": unittest.main()
