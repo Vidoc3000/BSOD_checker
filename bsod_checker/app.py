@@ -11,7 +11,7 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import __version__, debugger_install, diagnostics, dump_analysis, tweaks
+from . import __version__, debugger_install, diagnostics, dump_analysis, elevation, tweaks
 
 BG = "#0b1020"
 PANEL = "#151e32"
@@ -31,6 +31,7 @@ class App(tk.Tk):
         self.minsize(900, 680)
         self.configure(bg=BG)
         self.report = None
+        self.active_dump_path = None
         self.items = {}
         self.results = queue.Queue()
         self.settings_path = tweaks.data_dir() / "settings.json"
@@ -222,6 +223,7 @@ class App(tk.Tk):
         values = self._numbers()
         if not values: return
         cdb_path, online = self.cdb_path.get().strip(), self.online_symbols.get()
+        self.active_dump_path = None
         self._set_busy(True); self.status.set("Чтение событий и поиск дампов…")
         def work():
             try:
@@ -266,6 +268,7 @@ class App(tk.Tk):
         dump = diagnostics.Dump(path, datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"), stat.st_size)
         report = self.report or diagnostics.Report(datetime.now().isoformat(timespec="seconds"), platform.platform(), values[0])
         cdb_path, online = self.cdb_path.get().strip(), self.online_symbols.get()
+        self.active_dump_path = path
         self._set_busy(True); self.status.set("Подготовка к анализу выбранного дампа…")
         def work():
             try:
@@ -345,6 +348,16 @@ class App(tk.Tk):
         self._set_text(self.details, "Выберите запись слева." if self.items else "Данные не найдены. Отсутствие событий или дампов не исключает BSOD.\n\n" + "\n".join(report.warnings))
         self._set_text(self.rec_text, "\n\n".join(f"{title}\n{body}" for title, body in diagnostics.recommendations(report)))
         self.status.set("Анализ завершён с предупреждениями" if report.warnings or errors or any(d.analysis.status == "partial" for d in report.dumps) else "Анализ завершён")
+        denied = [d for d in report.dumps if d.analysis.error_code == "access_denied"
+                  and (self.active_dump_path is None or os.path.normcase(d.path) == os.path.normcase(self.active_dump_path))]
+        if denied and not elevation.is_elevated():
+            if messagebox.askyesno("Нет доступа к дампу", "Windows отказала в доступе к файлу дампа. Перезапустить BSOD Checker от имени администратора?\n\nПотребуется подтверждение UAC. Несохранённый отчёт и настройки будут потеряны; после перезапуска запустите анализ снова.", parent=self):
+                try:
+                    elevation.restart_as_admin()
+                except OSError as exc:
+                    messagebox.showerror("Не удалось перезапустить", str(exc), parent=self)
+                else:
+                    self.destroy()
 
     @staticmethod
     def _dump_details(dump):

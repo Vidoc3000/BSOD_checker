@@ -17,6 +17,7 @@ class DumpAnalysis:
     # status is one of ok, partial, error or skipped; no conclusion is fabricated.
     status: str = "skipped"
     message: str = "Дамп ещё не анализировался."
+    error_code: str = ""
     bugcheck_code: int | None = None
     bugcheck_name: str = ""
     arguments: list[str] = field(default_factory=list)
@@ -61,6 +62,13 @@ def _field(output: str, name: str) -> str:
 def parse_output(output: str) -> DumpAnalysis:
     """Extract known fields while keeping the complete debugger output for inspection."""
     result = DumpAnalysis(raw_output=output)
+    # The numeric Win32 code is stable even if the accompanying message is localized.
+    if re.search(r"(?im)(?:could not open dump file|unable to open dump file|debuggee initialization failed)[^\r\n]*win32 error[ \t]+(?:0n0*5|0x0*5|0*5)(?![0-9a-f])", output):
+        result.status = "error"
+        result.error_code = "access_denied"
+        result.message = ("Windows отказала отладчику в доступе к дампу (Win32 error 5). "
+                          "Повторите анализ от имени администратора. Если ошибка останется, проверьте разрешения файла и защитное ПО.")
+        return result
     code = _field(output, "BUGCHECK_CODE")
     if not re.fullmatch(r"(?:0x)?[0-9a-fA-F`]+", code):
         match = re.search(r"(?im)^\s*BugCheck\s+([0-9a-f`]+)\s*,", output)
@@ -123,7 +131,8 @@ def analyze_dump(path: str, cdb: str, online_symbols: bool = False, timeout: int
         parsed = parse_output(output)
         if result.returncode != 0:
             parsed.status = "error"
-            parsed.message = f"Отладчик завершился с кодом {result.returncode}. Проверьте доступ к дампу и вывод отладчика."
+            if not parsed.error_code:
+                parsed.message = f"Отладчик завершился с кодом {result.returncode}. Проверьте доступ к дампу и вывод отладчика."
         return parsed
     except subprocess.TimeoutExpired as exc:
         output = exc.stdout or ""
